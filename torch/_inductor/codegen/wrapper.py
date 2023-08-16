@@ -8,9 +8,9 @@ from itertools import count
 from typing import Any, Dict, List, Optional, Tuple
 
 import sympy
-from sympy import Expr
 
 import torch
+from sympy import Expr
 from torch._dynamo.utils import counters, dynamo_timed
 from torch.fx.experimental.symbolic_shapes import SymTypes
 from torch.fx.node import _get_qualified_name
@@ -469,6 +469,9 @@ class WrapperCodeGen(CodeGen):
         cpp_op_schema,
         cpp_kernel_key,
         cpp_kernel_overload_name="",
+        op_overload=None,
+        raw_args=None,
+        raw_kwargs=None,
     ):
         self.writeline(f"{name} = {kernel}({', '.join(codegen_args)})")
 
@@ -902,7 +905,7 @@ class CppWrapperCodeGen(WrapperCodeGen):
         self.closed_bracket = "}"
         self.comment = "//"
         self.namespace = "at::"
-        self.none_str = "at::Tensor()"
+        self.none_str = "nullptr"
         self.extern_call_ops = set()
         self.size = "sizes()"
         self.stride = "strides()"
@@ -968,7 +971,8 @@ class CppWrapperCodeGen(WrapperCodeGen):
                 void AOTInductorModel::run_impl(
                     const std::vector<at::Tensor>& args,
                     std::vector<at::Tensor>& outputs,
-                    cudaStream_t stream) {
+                    cudaStream_t stream,
+                    ProxyExecutor* proxy_executor) {
                 """
             )
         else:
@@ -1267,7 +1271,96 @@ class CppWrapperCodeGen(WrapperCodeGen):
             f"{self.codegen_tensor_option(device, dtype)};"
         )
 
+    def generate_extern_kernel_args_decl_if_needed(self, op_overload, raw_args, output_args):
+        arg_types = [x.real_type for x in op_overload._schema.arguments]
+        return_types = [x.type for x in op_overload._schema.returns]
+
+        new_tensor_args = []
+        new_int_args = []
+
+        def fill_args(arg, arg_type, allow_none):
+            if isinstance(arg_type, torch.TensorType):
+                if arg is not None:
+                    assert isinstance(arg, ir.InputBuffer)
+                    new_tensor_args.append(f"&{arg.name}")
+            elif isinstance(arg_type, torch.ListType) and isinstance(arg_type.getElementType(), torch.TensorType):
+                if arg is not None:
+                    assert isinstance(arg, (list, tuple))
+                    new_tensor_args.extend([f"&{a.name}" for a in arg])
+            elif isinstance(arg_type, torch.SymIntType):
+                if arg is not None:
+                    assert isinstance(arg, int)
+                    new_int_args.append(str(arg))
+            elif isinstance(arg_type, torch.ListType) and isinstance(arg_type.getElementType(), torch.SymIntType):
+                if arg is not None:
+                    assert isinstance(arg, (list, tuple))
+                    new_int_args.extend([str(a) for a in arg])
+
+        for arg, arg_type in zip(raw_args, arg_types):
+            if isinstance(arg_type, torch.OptionalType):
+                fill_args(arg, arg_type.getElementType(), True)
+            else:
+                fill_args(arg, arg_type, False)
+
+        # breakpoint()
+
+        def fill_output_arg(arg, arg_type, allow_none):
+            if isinstance(return_type, torch.TensorType):
+                if arg is not None:
+                    self.writeline(f"at::Tensor {arg};  // output buffer")
+                    new_tensor_args.append(f"&{output_arg}")
+            elif isinstance(return_type, torch.ListType) and isinstance(return_type.getElementType(), torch.TensorType):
+                # TODO: handle tensor list return type
+                pass
+
+        for output_arg, return_type in zip(output_args, return_types):
+            # TODO: check schema here
+            # assume it's a tensor now
+            if isinstance(return_type, torch.OptionalType):
+                fill_output_arg(output_arg, return_type.getElementType(), True)
+            else:
+                fill_output_arg(output_arg, return_type, False)
+
+        # breakpoint()
+
+        return new_tensor_args, new_int_args
+
     def generate_extern_kernel_alloc_and_find_schema_if_needed(
+        self,
+        name,
+        kernel,
+        codegen_args,
+        cpp_op_schema,
+        cpp_kernel_key,
+        cpp_kernel_overload_name="",
+        op_overload=None,
+        raw_args=None,
+        raw_kwargs=None,
+    ):
+        if config.is_fbcode():
+            return self.generate_extern_kernel_alloc_and_find_schema_if_needed_fbcode(
+                name,
+                kernel,
+                codegen_args,
+                cpp_op_schema,
+                cpp_kernel_key,
+                cpp_kernel_overload_name,
+                op_overload,
+                raw_args,
+                raw_kwargs,
+            )
+        else:
+            return self.generate_extern_kernel_alloc_and_find_schema_if_needed_oss(
+                name,
+                kernel,
+                codegen_args,
+                cpp_op_schema,
+                cpp_kernel_key,
+                cpp_kernel_overload_name,
+            )
+
+
+    def generate_extern_kernel_alloc_and_find_schema_if_needed_oss(
         self,
         name,
         kernel,
@@ -1289,6 +1382,39 @@ class CppWrapperCodeGen(WrapperCodeGen):
         self.writeline(
             f"auto {name} = op_{cpp_kernel_key}.call({', '.join(codegen_args)});"
         )
+
+
+    def generate_extern_kernel_alloc_and_find_schema_if_needed_fbcode(
+        self,
+        name,
+        kernel,
+        codegen_args,
+        cpp_op_schema,
+        cpp_kernel_key,
+        cpp_kernel_overload_name="",
+        op_overload=None,
+        raw_args=None,
+        raw_kwargs=None,
+    ):
+        output_args = [name]
+
+        # TODO: handle kwargs
+        tensor_call_args, int_call_args = self.generate_extern_kernel_args_decl_if_needed(op_overload, raw_args, output_args)
+
+        tensor_args_var = f"tensor_args_var_{next(self.kernel_callsite_id)}"
+        tensor_call_args_str = ", ".join(tensor_call_args)
+        self.writeline(f"void* {tensor_args_var}[] = {{{tensor_call_args_str}}};")
+
+        int_args_var = f"int_args_var_{next(self.kernel_callsite_id)}"
+        int_call_args_str = ", ".join(int_call_args)
+        self.writeline(f"int64_t {int_args_var}[] = {{{int_call_args_str}}};")
+
+        self.writeline(f"proxy_executor->call_function(\"{name}\", "
+            f"{int_args_var}, "
+            f"{tensor_args_var});")
+
+        self.extern_call_ops.add(cpp_kernel_key)
+
 
     def val_to_str(self, val):
         from .cpp import DTYPE_TO_ATEN

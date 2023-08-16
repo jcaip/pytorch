@@ -517,6 +517,8 @@ class GraphModuleSerializer:
                 return Argument.create(as_sym_bool=SymBoolArgument.create(as_name=arg.name))
             else:
                 return Argument.create(as_tensor=TensorArgument(name=arg.name))
+        elif isinstance(arg, torch._inductor.ir.InputBuffer):
+            return Argument.create(as_tensor=TensorArgument(name=arg.name))
         elif isinstance(arg, bool):
             return Argument.create(as_bool=arg)
         elif isinstance(arg, str):
@@ -570,6 +572,11 @@ class GraphModuleSerializer:
                         raise SerializeError(f"Unsupported list/tuple argument: {a}")
                 return Argument.create(
                     as_optional_tensors=list(map(serialize_optional_tensor_args, arg))
+                )
+            elif all(isinstance(a, torch._inductor.ir.InputBuffer) for a in arg):
+                # list of tensors
+                return Argument.create(
+                    as_tensors=[TensorArgument(name=a.name) for a in arg],
                 )
             else:
                 raise SerializeError(f"Unsupported list/tuple argument type: {type(arg[0])}")
