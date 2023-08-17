@@ -89,6 +89,8 @@ void cpu_flash_attention(
       sdp::calculate_scale(query, scale).as_float_unchecked();
 
   // Sizes
+  TORCH_CHECK((query.size(3) == value.size(3)) && (key.size(3) == value.size(3)),
+        "scaled_dot_product_attention_flash_attention: Q/K/V should have the same head size");
   int64_t batchSize = query.size(0);
   int64_t qSize = query.size(1);
   int64_t kvSize = value.size(1);
@@ -291,7 +293,6 @@ void cpu_flash_attention_backward(
     const at::Tensor& philox_seed,
     const at::Tensor& philox_offset,
     c10::optional<double> scale) {
-
   constexpr bool is_reduced_type = is_reduced_floating_point_v<scalar_t>;
   using accum_t = at::opmath_type<scalar_t>;
   using Vec = vec::Vectorized<accum_t>;
@@ -299,6 +300,8 @@ void cpu_flash_attention_backward(
       sdp::calculate_scale(query, scale).as_float_unchecked();
 
   // Sizes
+  TORCH_CHECK((query.size(3) == value.size(3)) && (key.size(3) == value.size(3)),
+        "scaled_dot_product_attention_flash_attention_backward: Q/K/V should have the same head size");
   // Query (Batch x Q_seq_len  x Num_heads x Dim_per_head)
   // Key   (Batch x KV_seq_len x Num_heads x Dim_per_head)
   // Value (Batch x KV_seq_len x Num_heads x Dim_per_head)
